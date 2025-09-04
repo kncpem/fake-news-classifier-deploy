@@ -1,4 +1,7 @@
+# Ignore virtual environment
 .venv/
+
+# Ignore data files
 submit.csv
 test.csv
 train.csv
@@ -6,4 +9,6 @@ X_train_embeddings.npy
 X_val_embeddings.npy
 preprocessed_articles.csv
 preprocessed_articles_test_data.csv
+
+# Ignore documentation
 Fake News Classifier.pdf
