@@ -1,64 +1,106 @@
 import streamlit as st
-import joblib
 import numpy as np
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem.porter import PorterStemmer
+import joblib
+from sentence_transformers import SentenceTransformer
 import re
 
-# Load your trained model and CountVectorizer
-model = joblib.load('fake_news_classifier.pkl')
-cv = joblib.load('count_vectorizer.pkl')
+# ----------------------------
+# Page config MUST be first
+# ----------------------------
+st.set_page_config(page_title="📰 Fake News Classifier", layout="centered")
 
-nltk.download('stopwords')
+# ----------------------------
+# Settings
+# ----------------------------
+# Adjust to your training choice. Most of our earlier code used 0=Real, 1=Fake.
+LABEL_TEXT = {0: "🟢 Real News", 1: "🔴 Fake News"}
+CHUNK_MAX_WORDS = 400  # keep consistent with how you trained
 
-st.title('Fake News Classifier')
+# ----------------------------
+# Cache heavy objects
+# ----------------------------
+@st.cache_resource
+def load_resources():
+    embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    # Load your pickled XGBoost model
+    xgb_clf = joblib.load("xgb_fake_news.pkl")
+    return embedder, xgb_clf
 
-# Create a string with HTML for the icon and the text
-custom_text2 = f"""
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
-<p style="font-size:12px; color:grey;">
-    <i class="fas fa-newspaper" style="margin-right:4px;"></i>
-    by kncpem
-</p>
-"""
+embedder, xgb_clf = load_resources()
 
-# Display the custom text with the icon using st.markdown
-st.markdown(custom_text2, unsafe_allow_html=True)
+# ----------------------------
+# Helpers
+# ----------------------------
+def split_text(text: str, max_words: int = CHUNK_MAX_WORDS):
+    words = re.split(r"\s+", text.strip())
+    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words) if words[i:i+max_words]]
 
-input_text = st.text_area("Enter the news text:")
+@st.cache_data
+def embed_chunks(chunks):
+    # returns a numpy array (n_chunks, dim)
+    return embedder.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
 
-def preprocess_title(title):
-    ps = PorterStemmer()
-    review = re.sub('[^a-zA-Z]', ' ', title)
-    review = review.lower()
-    review = review.split()
-    review = [ps.stem(word) for word in review if not word in stopwords.words('english')]
-    review = ' '.join(review)
-    return review
+def predict_article(text: str):
+    chunks = split_text(text)
+    if not chunks:
+        return None, None, None
+
+    X = embed_chunks(chunks)
+
+    # Prefer probability averaging if available (more stable than hard vote)
+    if hasattr(xgb_clf, "predict_proba"):
+        proba = xgb_clf.predict_proba(X)[:, 1]  # probability of label "1" (Fake)
+        mean_p_fake = float(np.mean(proba))
+        final_label = 1 if mean_p_fake >= 0.5 else 0
+        return final_label, proba, chunks
+    else:
+        preds = xgb_clf.predict(X)
+        # majority vote fallback
+        vals, counts = np.unique(preds, return_counts=True)
+        final_label = int(vals[np.argmax(counts)])
+        return final_label, preds, chunks
+
+# ----------------------------
+# UI
+# ----------------------------
+st.title("📰 Fake News Classifier (SBERT + XGBoost)")
+st.write("Paste an article; long inputs are automatically chunked and aggregated.")
+
+user_text = st.text_area("Article text", height=220, placeholder="Paste news article here...")
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    chunk_size = st.number_input("Chunk size (words)", min_value=100, max_value=800, value=CHUNK_MAX_WORDS, step=50)
+with col2:
+    thresh = st.slider("Fake threshold (probability)", 0.05, 0.95, 0.50, 0.05)
 
 if st.button("Classify"):
-    preprocessed_title = preprocess_title(input_text)
-    
-    # Transform the input text using the fitted CountVectorizer
-    title_vector = cv.transform([preprocessed_title]).toarray()
-    
-    # Perform prediction
-    prediction = model.predict(title_vector)
-    
-    try:
-        prediction_proba = model._predict_proba_lr(title_vector)
-        confidence = prediction_proba[0][prediction[0]] * 100
-    except AttributeError:
-        confidence = "N/A"
+    if not user_text.strip():
+        st.warning("Please paste some text.")
+    else:
+        # temporarily override chunk size if changed by user
+        # global CHUNK_MAX_WORDS
+        # CHUNK_MAX_WORDS = int(chunk_size)
 
-    # Output with better-decorated font
-    st.markdown(f"""
-        <div style="text-align: center; font-size: 24px; font-weight: bold; color: {'green' if prediction[0] == 1 else 'red'};">
-            Prediction: {'Real News' if prediction[0] == 1 else 'Fake News'}
-        </div>
-        <div style="text-align: center; font-size: 20px; margin-top: 10px;">
-            Confidence: {confidence if isinstance(confidence, str) else f'{confidence:.2f}%'}
-        </div>
-    """, unsafe_allow_html=True)
-    st.write("by kncpem")
+        label, scores, chunks = predict_article(user_text)
+        if label is None:
+            st.error("Could not process input.")
+        else:
+            # If we had probabilities, recalc with user-chosen threshold for display
+            if scores is not None and scores.ndim == 1 and scores.size == len(chunks):
+                mean_p_fake = float(np.mean(scores))
+                label = 1 if mean_p_fake >= thresh else 0
+                st.subheader(f"Final: **{LABEL_TEXT[label]}**")
+                st.caption(f"Mean P(Fake) across chunks: {mean_p_fake:.3f}  •  threshold={thresh:.2f}")
+                with st.expander("Chunk details"):
+                    for i, (c, p) in enumerate(zip(chunks, scores), start=1):
+                        st.write(f"**Chunk {i}** — P(Fake)={p:.3f}")
+                        st.write(c[:300] + ("…" if len(c) > 300 else ""))
+                        st.markdown("---")
+            else:
+                st.subheader(f"Final: **{LABEL_TEXT[label]}**")
+                with st.expander("Chunk predictions"):
+                    for i, (c, p) in enumerate(zip(chunks, scores), start=1):
+                        st.write(f"**Chunk {i}** — {LABEL_TEXT[int(p)]}")
+                        st.write(c[:300] + ("…" if len(c) > 300 else ""))
+                        st.markdown("---")
